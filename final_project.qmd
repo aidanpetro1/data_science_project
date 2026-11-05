@@ -21,7 +21,7 @@ Final project repository: <https://github.com/aidanpetro1/data_science_project>
 
 ## Introduction {#sec-introduction}
 
-AIHA is an anemia caused by the hemolysis of red blood cells via auto-antibodies. While anemia is common, hemolysis and autoimmune causes are not as common and part of the workup is not ordered unless clinically suspected. The standard panel contains haptoglobin, LDH, indirect bilirubin to confirm hemolysis and a DAT. However, hemolysis also leaves traces on CBC data including raised MCV, RDW and MCHC in certain subtypes. A model that reads these traces of commonly ordered labs could help recognize people who would benefit from early diagnosis.
+AIHA is an anemia caused by the hemolysis of red blood cells via auto-antibodies. While anemia is common, hemolysis and autoimmune causes are not as common and part of the workup is not ordered unless clinically suspected. The standard panel contains haptoglobin, LDH, indirect bilirubin to confirm hemolysis and a DAT. However, hemolysis also leaves traces on CBC data, including raised MCV, RDW and MCHC in certain subtypes. A model that reads these traces of commonly ordered labs could help recognize people who would benefit from early diagnosis.
 
 
 ## Methods {#sec-methods}
