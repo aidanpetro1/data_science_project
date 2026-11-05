@@ -23,13 +23,12 @@ Final project repository: <https://github.com/aidanpetro1/data_science_project>
 
 AIHA is an anemia caused by the hemolysis of red blood cells via auto-antibodies. While anemia is common, hemolysis and autoimmune causes are not as common and part of the workup is not ordered unless clinically suspected. The standard panel contains haptoglobin, LDH, indirect bilirubin to confirm hemolysis and a DAT. However, hemolysis also leaves traces on CBC data including raised MCV, RDW and MCHC in certain subtypes. A model that reads these traces of commonly ordered labs could help recognize people who would benefit from early diagnosis.
 
-The problem draws on hematology, which defines AIHA and its workup; laboratory medicine, which explains the CBC artifacts and sets the limits for abnormal hemolysis labs; clinical informatics, which turns codes and labs into a computable phenotype and places the model in clinical decision support (CDS); and data science, which handles a rare outcome and a label that exists only for tested patients. Dr. Daniel Herman (Pathology and Laboratory Medicine, Penn) shaped three choices: start with a model using only the CBC, age, and sex; build the cohort from new normocytic or macrocytic anemia, excluding sickle cell disease and chronic kidney disease; and, without blood bank confirmation, label cases with a composite of hemolysis markers (at least two of low haptoglobin, high indirect bilirubin, high LDH). That composite is the core of the phenotype here, since MIMIC-IV has no DAT. \[ADD SECOND FACULTY/STAFF MEETING AND TAKEAWAYS\]
 
 ## Methods {#sec-methods}
 
 ### Data
 
-MIMIC-IV is a deidentified database from Beth Israel Deaconess Medical Center, distributed through PhysioNet. This analysis uses six `hosp` tables: `patients`, `admissions`, `labevents`, `d_labitems`, `diagnoses_icd`, and `d_icd_diagnoses`. The code reads from `mimic_dir`, which currently points at the open 100-patient demo, so all counts below are demo counts. Pointing it at the full release reruns the analysis.
+This analysis uses six `hosp` tables: `patients`, `admissions`, `labevents`, `d_labitems`, `diagnoses_icd`, and `d_icd_diagnoses`. The code reads from `mimic_dir`, which currently points at the open 100-patient demo, so all counts below are demo counts. Pointing it at the full release reruns the analysis.
 
 ### Approach
 
@@ -344,10 +343,3 @@ not_worked_up |>
             aiha_code_recommended = sum(aiha_code & recommend_panel))
 ```
 
-### Interpretation so far
-
-The demo runs through the phenotype but has too few cases to train the model, which runs on the full release. Two limitations: the model learns only from tested patients, and the hemolysis rule also catches non-immune hemolysis and liver disease, while the AIHA tier relies on codes because MIMIC-IV has no DAT.
-
-## Conclusion
-
-To be written once the model is trained on the full release.
