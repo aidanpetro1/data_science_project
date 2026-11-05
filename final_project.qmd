@@ -1,0 +1,353 @@
+---
+title: "Phenotyping Autoimmune Hemolytic Anemia to Drive the First Step of Workup"
+subtitle: "BMIN5030 Final Project"
+author: "Aidan Petrovich"
+format: html
+editor: visual
+number-sections: true
+embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+------------------------------------------------------------------------
+
+## Overview {#sec-overview}
+
+Autoimmune hemolytic anemia (AIHA) is often diagnosed late as the workup begins with a hemolysis work up. Using MIMIC-IV we build a computable phenotype for hemolysis and AIHA. We then find anemic patients who were never worked up for hemolysis and train a model that recommends a hemolysis work up from predictors such as CBC and demographic information.
+
+Final project repository: <https://github.com/aidanpetro1/data_science_project>
+
+## Introduction {#sec-introduction}
+
+AIHA is an anemia caused by the hemolysis of red blood cells via auto-antibodies. While anemia is common, hemolysis and autoimmune causes are not as common and part of the workup is not ordered unless clinically suspected. The standard panel contains haptoglobin, LDH, indirect bilirubin to confirm hemolysis and a DAT. However, hemolysis also leaves traces on CBC data including raised MCV, RDW and MCHC in certain subtypes. A model that reads these traces of commonly ordered labs could help recognize people who would benefit from early diagnosis.
+
+The problem draws on hematology, which defines AIHA and its workup; laboratory medicine, which explains the CBC artifacts and sets the limits for abnormal hemolysis labs; clinical informatics, which turns codes and labs into a computable phenotype and places the model in clinical decision support (CDS); and data science, which handles a rare outcome and a label that exists only for tested patients. Dr. Daniel Herman (Pathology and Laboratory Medicine, Penn) shaped three choices: start with a model using only the CBC, age, and sex; build the cohort from new normocytic or macrocytic anemia, excluding sickle cell disease and chronic kidney disease; and, without blood bank confirmation, label cases with a composite of hemolysis markers (at least two of low haptoglobin, high indirect bilirubin, high LDH). That composite is the core of the phenotype here, since MIMIC-IV has no DAT. \[ADD SECOND FACULTY/STAFF MEETING AND TAKEAWAYS\]
+
+## Methods {#sec-methods}
+
+### Data
+
+MIMIC-IV is a deidentified database from Beth Israel Deaconess Medical Center, distributed through PhysioNet. This analysis uses six `hosp` tables: `patients`, `admissions`, `labevents`, `d_labitems`, `diagnoses_icd`, and `d_icd_diagnoses`. The code reads from `mimic_dir`, which currently points at the open 100-patient demo, so all counts below are demo counts. Pointing it at the full release reruns the analysis.
+
+### Approach
+
+| Step | Question | Definition |
+|------------------------|------------------------|------------------------|
+| 1\. Index CBC | New normocytic or macrocytic anemia? | First adult CBC with hemoglobin \<13 g/dL (men) or \<12 g/dL (women) and MCV ≥80 fL; sickle cell disease and CKD excluded |
+| 2\. Workup status | Was hemolysis checked? | ≥2 of haptoglobin, LDH, indirect bilirubin measured from 1 day before to 7 days after the index CBC |
+| 3\. Hemolysis | Was it positive? | ≥2 of haptoglobin \<30 mg/dL, LDH \>250 IU/L, indirect bilirubin \>1.0 mg/dL |
+| 4\. AIHA | Was it autoimmune? | Hemolysis plus an AIHA code (D59.0, D59.1, or 283.0) on an admission ending at or after the index CBC |
+| 5\. CDS model | Should an untested patient get a panel? | Model trained on tested patients to predict hemolysis from the index CBC, age, and sex, then applied to untested patients |
+
+The model learns only from patients clinicians chose to test, a limitation discussed with the results.
+
+### Setup
+
+```{r setup}
+library(tidyverse)
+library(glmnet)
+library(ranger)
+library(pROC)
+library(rsample)
+
+# Folder holding the MIMIC-IV hosp CSV files (*.csv.gz).
+# Demo: https://physionet.org/content/mimic-iv-demo/2.2/
+mimic_dir <- "data/mimic-iv-demo/hosp"
+
+# Fetch the open-access demo tables if they are not already here
+demo_tables <- c("patients", "admissions", "labevents", "d_labitems",
+                 "diagnoses_icd", "d_icd_diagnoses")
+if (str_detect(mimic_dir, "demo")) {
+  dir.create(mimic_dir, recursive = TRUE, showWarnings = FALSE)
+  for (t in demo_tables) {
+    f <- file.path(mimic_dir, paste0(t, ".csv.gz"))
+    if (!file.exists(f)) {
+      download.file(paste0("https://physionet.org/files/mimic-iv-demo/2.2/hosp/",
+                           t, ".csv.gz"), f, mode = "wb", quiet = TRUE)
+    }
+  }
+}
+
+read_mimic <- function(table, ...) {
+  read_csv(file.path(mimic_dir, paste0(table, ".csv.gz")),
+           show_col_types = FALSE, ...)
+}
+
+set.seed(5030)
+```
+
+### What MIMIC-IV records for this workup
+
+Which steps of the workup does MIMIC-IV record?
+
+```{r dictionaries}
+d_icd <- read_mimic("d_icd_diagnoses", col_types = cols(icd_code = "c"))
+d_lab <- read_mimic("d_labitems")
+
+# Autoimmune hemolytic anemia codes
+d_icd |>
+  filter((icd_version == 10 & icd_code %in% c("D590", "D591", "D5911", "D5912", "D5913", "D5919")) |
+         (icd_version == 9  & icd_code == "2830"))
+
+# Hemolysis labs and blood bank tests
+d_lab |>
+  filter(fluid == "Blood",
+         str_detect(str_to_lower(label),
+           "haptoglobin|lactate dehydrogenase \\(ld\\)|bilirubin, indirect|reticulocyte count, automated|coomb|antiglobulin|cold|agglut")) |>
+  arrange(label)
+```
+
+Hemolysis labs are present. The DAT and cold agglutinin titer are not, and the v2.2 ICD-10 codes stop at D59.1, so warm AIHA and CAD cannot be separated (to recheck on v3.1). The phenotype stops at AIHA, and the model targets the observable step: the hemolysis panel.
+
+### Extracting CBCs and hemolysis labs
+
+```{r lab-items}
+lab_items <- tribble(
+  ~itemid, ~feature,
+  51222, "hgb",   51279, "rbc",   51250, "mcv",   51248, "mch",
+  51249, "mchc",  51277, "rdw",   51301, "wbc",   51265, "plt",
+  50935, "hapto", 50954, "ldh",   50884, "ibili"
+)
+cbc_features <- c("hgb", "rbc", "mcv", "mch", "mchc", "rdw", "wbc", "plt")
+
+d_lab |> semi_join(lab_items, by = "itemid") |> select(itemid, label, category)
+```
+
+`labevents` is read in chunks, keeping only these items, and cached.
+
+```{r lab-extract}
+lab_cache <- file.path(dirname(mimic_dir), "labs_long.rds")
+
+if (file.exists(lab_cache)) {
+  labs_long <- readRDS(lab_cache)
+} else {
+  keep <- function(x, pos) filter(x, itemid %in% lab_items$itemid, !is.na(valuenum))
+  labs_long <- read_csv_chunked(
+    file.path(mimic_dir, "labevents.csv.gz"),
+    DataFrameCallback$new(keep),
+    chunk_size = 1e6,
+    col_types = cols_only(subject_id = "i", specimen_id = "i", itemid = "i",
+                          charttime = "T", valuenum = "d")) |>
+    inner_join(lab_items, by = "itemid")
+  saveRDS(labs_long, lab_cache)
+}
+
+labs_long |> count(feature, name = "results")
+```
+
+### Step 1: index CBC and exclusions
+
+```{r index-cbc}
+patients   <- read_mimic("patients")
+admissions <- read_mimic("admissions")
+dx         <- read_mimic("diagnoses_icd", col_types = cols(icd_code = "c"))
+
+# One row per CBC specimen
+cbc <- labs_long |>
+  filter(feature %in% cbc_features) |>
+  group_by(subject_id, specimen_id, charttime, feature) |>
+  summarise(value = first(valuenum), .groups = "drop") |>
+  pivot_wider(names_from = feature, values_from = value)
+
+# Age is reconstructed from MIMIC's shifted anchor year
+index_cbc <- cbc |>
+  filter(!is.na(hgb), !is.na(mcv)) |>
+  inner_join(patients |> select(subject_id, gender, anchor_age, anchor_year),
+             by = "subject_id") |>
+  mutate(age = anchor_age + year(charttime) - anchor_year,
+         anemic = if_else(gender == "M", hgb < 13, hgb < 12)) |>
+  filter(age >= 18, anemic, mcv >= 80) |>
+  group_by(subject_id) |>
+  slice_min(charttime, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  rename(index_time = charttime)
+
+excluded <- dx |>
+  filter((icd_version == 10 & str_detect(icd_code, "^(D57|N18)")) |
+         (icd_version == 9  & str_detect(icd_code, "^(2826|585)"))) |>
+  distinct(subject_id)
+
+cohort <- index_cbc |> anti_join(excluded, by = "subject_id")
+```
+
+### Steps 2 to 4: workup status and phenotypes
+
+The most abnormal value in the window is kept for each lab.
+
+```{r phenotype}
+window_labs <- labs_long |>
+  filter(feature %in% c("hapto", "ldh", "ibili")) |>
+  inner_join(cohort |> select(subject_id, index_time), by = "subject_id") |>
+  filter(charttime >= index_time - days(1), charttime <= index_time + days(7)) |>
+  group_by(subject_id, feature) |>
+  summarise(value = if (first(feature) == "hapto") min(valuenum) else max(valuenum),
+            .groups = "drop") |>
+  pivot_wider(names_from = feature, values_from = value)
+
+aiha_codes <- c("D590", "D591", "D5911", "D5912", "D5913", "D5919", "2830")
+
+aiha_after_index <- dx |>
+  filter(icd_code %in% aiha_codes) |>
+  inner_join(admissions |> select(hadm_id, dischtime), by = "hadm_id") |>
+  inner_join(cohort |> select(subject_id, index_time), by = "subject_id") |>
+  filter(dischtime >= index_time) |>
+  distinct(subject_id)
+
+phenotype <- cohort |>
+  left_join(window_labs, by = "subject_id") |>
+  mutate(
+    n_measured = (!is.na(hapto)) + (!is.na(ldh)) + (!is.na(ibili)),
+    n_abnormal = coalesce(hapto < 30, FALSE) + coalesce(ldh > 250, FALSE) +
+                 coalesce(ibili > 1.0, FALSE),
+    worked_up  = n_measured >= 2,
+    hemolysis  = worked_up & n_abnormal >= 2,
+    aiha_code  = subject_id %in% aiha_after_index$subject_id,
+    aiha       = hemolysis & aiha_code,
+    group = case_when(
+      aiha       ~ "AIHA (hemolysis + AIHA code)",
+      hemolysis  ~ "Hemolysis, no AIHA code",
+      worked_up  ~ "Worked up, no hemolysis",
+      TRUE       ~ "Not worked up"))
+```
+
+## Results {#sec-results}
+
+### Cohort and phenotype
+
+```{r cohort-flow}
+tibble(
+  step = c("Adults with a qualifying anemic CBC",
+           "After excluding sickle cell disease and CKD",
+           "Worked up (at least 2 of 3 hemolysis labs)",
+           "Hemolysis phenotype",
+           "AIHA phenotype"),
+  patients = c(nrow(index_cbc), nrow(cohort), sum(phenotype$worked_up),
+               sum(phenotype$hemolysis), sum(phenotype$aiha))
+)
+
+phenotype |> count(group, name = "patients")
+```
+
+```{r cbc-by-group}
+#| fig-cap: "CBC indices at the index CBC by phenotype group."
+phenotype |>
+  select(group, mcv, mchc, rdw, hgb) |>
+  pivot_longer(-group, names_to = "index", values_to = "value") |>
+  ggplot(aes(group, value)) +
+  geom_boxplot(outlier.size = 0.5) +
+  facet_wrap(~ index, scales = "free_y") +
+  labs(x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+### Step 5: model recommending a hemolysis panel
+
+Lasso logistic regression and a random forest are compared with 5-fold stratified cross-validation on worked-up patients. The threshold is set to catch 90% of hemolysis cases, and the model is then applied to untested patients.
+
+```{r model}
+model_data <- phenotype |>
+  filter(worked_up) |>
+  mutate(male = as.integer(gender == "M"),
+         y = factor(hemolysis, levels = c(FALSE, TRUE), labels = c("no", "yes"))) |>
+  select(subject_id, y, all_of(cbc_features), age, male) |>
+  drop_na()
+
+predictors <- c(cbc_features, "age", "male")
+n_pos <- sum(model_data$y == "yes")
+n_neg <- sum(model_data$y == "no")
+enough <- n_pos >= 10 && n_neg >= 10
+
+cat("Worked-up patients with complete CBCs:", nrow(model_data),
+    "| hemolysis:", n_pos, "| no hemolysis:", n_neg, "\n")
+if (!enough) cat("Too few cases in this dataset to train and cross-validate the model.",
+                 "This chunk runs on the full MIMIC-IV release.\n")
+```
+
+```{r model-cv, eval = enough}
+fit_lasso <- function(train) {
+  cv.glmnet(as.matrix(train[predictors]), train$y, family = "binomial", alpha = 1)
+}
+pred_lasso <- function(fit, newdata) {
+  as.numeric(predict(fit, as.matrix(newdata[predictors]), s = "lambda.1se",
+                     type = "response"))
+}
+fit_rf <- function(train) {
+  ranger(y ~ ., data = train[c("y", predictors)], probability = TRUE,
+         num.trees = 500)
+}
+pred_rf <- function(fit, newdata) predict(fit, newdata[predictors])$predictions[, "yes"]
+
+folds <- vfold_cv(model_data, v = 5, strata = y)
+
+cv_preds <- map_dfr(folds$splits, function(s) {
+  train <- analysis(s); test <- assessment(s)
+  tibble(subject_id = test$subject_id, y = test$y,
+         lasso = pred_lasso(fit_lasso(train), test),
+         rf    = pred_rf(fit_rf(train), test))
+})
+
+auc_table <- map_dfr(c("lasso", "rf"), function(m) {
+  r <- roc(cv_preds$y, cv_preds[[m]], levels = c("no", "yes"), direction = "<",
+           quiet = TRUE)
+  ci <- ci.auc(r)
+  tibble(model = m, auroc = as.numeric(auc(r)), lower = ci[1], upper = ci[3])
+})
+auc_table
+```
+
+```{r roc-plot, eval = enough}
+#| fig-cap: "Cross-validated ROC curves for predicting the hemolysis phenotype."
+map_dfr(c("lasso", "rf"), function(m) {
+  r <- roc(cv_preds$y, cv_preds[[m]], levels = c("no", "yes"), direction = "<",
+           quiet = TRUE)
+  tibble(model = m, fpr = 1 - r$specificities, tpr = r$sensitivities)
+}) |>
+  ggplot(aes(fpr, tpr, linetype = model)) +
+  geom_step() +
+  geom_abline(linetype = "dotted") +
+  coord_equal() +
+  labs(x = "1 - specificity", y = "Sensitivity") +
+  theme_minimal()
+```
+
+```{r recommend, eval = enough}
+# Threshold that catches 90% of hemolysis cases in cross-validation (lasso)
+threshold <- quantile(cv_preds$lasso[cv_preds$y == "yes"], 0.10)
+
+at_threshold <- cv_preds |>
+  summarise(sensitivity = mean(lasso[y == "yes"] >= threshold),
+            ppv = mean(y[lasso >= threshold] == "yes"),
+            panels_per_case = 1 / ppv)
+at_threshold
+
+# Coefficients of the final lasso model
+final_lasso <- fit_lasso(model_data)
+coef(final_lasso, s = "lambda.1se")
+
+# Apply to anemic patients who were never worked up
+not_worked_up <- phenotype |>
+  filter(!worked_up) |>
+  mutate(male = as.integer(gender == "M")) |>
+  select(subject_id, aiha_code, all_of(cbc_features), age, male) |>
+  drop_na() |>
+  mutate(score = pred_lasso(final_lasso, pick(all_of(predictors))),
+         recommend_panel = score >= threshold)
+
+not_worked_up |>
+  summarise(patients = n(),
+            recommended = sum(recommend_panel),
+            share_recommended = mean(recommend_panel),
+            aiha_code_patients = sum(aiha_code),
+            aiha_code_recommended = sum(aiha_code & recommend_panel))
+```
+
+### Interpretation so far
+
+The demo runs through the phenotype but has too few cases to train the model, which runs on the full release. Two limitations: the model learns only from tested patients, and the hemolysis rule also catches non-immune hemolysis and liver disease, while the AIHA tier relies on codes because MIMIC-IV has no DAT.
+
+## Conclusion
+
+To be written once the model is trained on the full release.
