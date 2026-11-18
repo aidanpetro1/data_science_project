@@ -23,12 +23,13 @@ Final project repository: <https://github.com/aidanpetro1/data_science_project>
 
 AIHA is an anemia caused by the hemolysis of red blood cells via auto-antibodies. While anemia is common, hemolysis and autoimmune causes are not as common and part of the workup is not ordered unless clinically suspected. The standard panel contains haptoglobin, LDH, indirect bilirubin to confirm hemolysis and a DAT. However, hemolysis also leaves traces on CBC data, including raised MCV, RDW and MCHC in certain subtypes. A model that reads these traces of commonly ordered labs could help recognize people who would benefit from early diagnosis.
 
+The problem draws on hematology, which defines AIHA and its workup; laboratory medicine, which explains the CBC artifacts and sets the limits for abnormal hemolysis labs; clinical informatics, which turns codes and labs into a computable phenotype and places the model in clinical decision support (CDS); and data science, which handles a rare outcome and a label that exists only for tested patients. Dr. Daniel Herman (Pathology and Laboratory Medicine, Penn) shaped three choices: start with a model using only the CBC, age, and sex; build the cohort from new normocytic or macrocytic anemia, excluding sickle cell disease and chronic kidney disease; and, without blood bank confirmation, label cases with a composite of hemolysis markers (at least two of low haptoglobin, high indirect bilirubin, high LDH). That composite is the core of the phenotype here, since MIMIC-IV has no DAT. \[ADD SECOND FACULTY/STAFF MEETING AND TAKEAWAYS\]
 
 ## Methods {#sec-methods}
 
 ### Data
 
-This analysis uses six `hosp` tables: `patients`, `admissions`, `labevents`, `d_labitems`, `diagnoses_icd`, and `d_icd_diagnoses`. The code reads from `mimic_dir`, which currently points at the open 100-patient demo, so all counts below are demo counts. Pointing it at the full release reruns the analysis.
+MIMIC-IV is a deidentified database from Beth Israel Deaconess Medical Center, distributed through PhysioNet. This analysis uses six `hosp` tables: `patients`, `admissions`, `labevents`, `d_labitems`, `diagnoses_icd`, and `d_icd_diagnoses`. The analysis uses the full credentialed release (v3.1). The code reads from `mimic_dir`; pointing it at the open 100-patient demo runs the same code without credentials, though the demo is too small to train the model.
 
 ### Approach
 
@@ -40,7 +41,9 @@ This analysis uses six `hosp` tables: `patients`, `admissions`, `labevents`, `d_
 | 4\. AIHA | Was it autoimmune? | Hemolysis plus an AIHA code (D59.0, D59.1, or 283.0) on an admission ending at or after the index CBC |
 | 5\. CDS model | Should an untested patient get a panel? | Model trained on tested patients to predict hemolysis from the index CBC, age, and sex, then applied to untested patients |
 
-The model learns only from patients clinicians chose to test, a limitation discussed with the results.
+Two secondary analyses follow the main model: an alert-rate table, which shows what the model catches if it alerts on only the highest-scoring 5%, 10%, or 20% of patients, and a stricter hemolysis label that requires low haptoglobin, to check whether label noise limits the model.
+
+The model learns only from patients clinicians chose to test, a limitation discussed with the results. Counts between 1 and 9 are shown as "<10", per the PhysioNet data use agreement.
 
 ### Setup
 
@@ -52,8 +55,10 @@ library(pROC)
 library(rsample)
 
 # Folder holding the MIMIC-IV hosp CSV files (*.csv.gz).
-# Demo: https://physionet.org/content/mimic-iv-demo/2.2/
-mimic_dir <- "data/mimic-iv-demo/hosp"
+# Full credentialed release (v3.1) on Aidan's computer:
+mimic_dir <- "C:/Course/mimic-iv-3.1/hosp"
+# To run on the open demo instead, use:
+# mimic_dir <- "data/mimic-iv-demo/hosp"
 
 # Fetch the open-access demo tables if they are not already here
 demo_tables <- c("patients", "admissions", "labevents", "d_labitems",
@@ -75,6 +80,9 @@ read_mimic <- function(table, ...) {
 }
 
 set.seed(5030)
+
+# PhysioNet: show counts between 1 and 9 as "<10"
+suppress <- function(n) if_else(n > 0 & n < 10, "<10", format(n, big.mark = ","))
 ```
 
 ### What MIMIC-IV records for this workup
@@ -98,7 +106,7 @@ d_lab |>
   arrange(label)
 ```
 
-Hemolysis labs are present. The DAT and cold agglutinin titer are not, and the v2.2 ICD-10 codes stop at D59.1, so warm AIHA and CAD cannot be separated (to recheck on v3.1). The phenotype stops at AIHA, and the model targets the observable step: the hemolysis panel.
+Hemolysis labs are present, but the DAT and cold agglutinin titer are not, so the immune step of the workup cannot be observed. Version 3.1 does include the ICD-10 subtype codes D59.11 to D59.19, so warm AIHA and CAD can be told apart by code. The model targets the observable step: the hemolysis panel.
 
 ### Extracting CBCs and hemolysis labs
 
@@ -137,6 +145,8 @@ labs_long |> count(feature, name = "results")
 ```
 
 ### Step 1: index CBC and exclusions
+
+The index CBC is each adult's first CBC that meets the anemia and MCV criteria. Patients with a sickle cell disease code (D57, 282.6) or a CKD code (N18, 585) on any admission are excluded.
 
 ```{r index-cbc}
 patients   <- read_mimic("patients")
@@ -340,6 +350,118 @@ not_worked_up |>
             recommended = sum(recommend_panel),
             share_recommended = mean(recommend_panel),
             aiha_code_patients = sum(aiha_code),
-            aiha_code_recommended = sum(aiha_code & recommend_panel))
+            aiha_code_recommended = sum(aiha_code & recommend_panel)) |>
+  mutate(share_recommended = round(share_recommended, 3),
+         across(-share_recommended, suppress),
+         share_recommended = as.character(share_recommended)) |>
+  pivot_longer(everything(), names_to = "measure", values_to = "value")
 ```
 
+### Alert rates
+
+A CDS alert is limited by how many patients it flags. Here the threshold is set by alert rate instead of sensitivity: the model alerts on the top 5%, 10%, or 20% of cross-validated scores among worked-up patients. Lift is the PPV divided by the base rate of hemolysis among worked-up patients. The same thresholds are then applied to untested patients.
+
+```{r alert-rates, eval = enough}
+base_rate <- mean(cv_preds$y == "yes")
+
+alert_table <- map_dfr(c(0.05, 0.10, 0.20), function(p) {
+  cut <- quantile(cv_preds$lasso, 1 - p)
+  flagged <- cv_preds$lasso >= cut
+  flag_untested <- not_worked_up$score >= cut
+  tibble(
+    alert_rate        = p,
+    sensitivity       = mean(flagged[cv_preds$y == "yes"]),
+    ppv               = mean(cv_preds$y[flagged] == "yes"),
+    lift              = ppv / base_rate,
+    untested_share    = mean(flag_untested),
+    untested_flagged  = suppress(sum(flag_untested)),
+    aiha_code_flagged = suppress(sum(flag_untested & not_worked_up$aiha_code))
+  )
+})
+
+cat("Base rate of hemolysis among worked-up patients:", round(base_rate, 3), "\n")
+alert_table |> print(width = Inf)
+```
+
+### Stricter hemolysis label
+
+The main label counts any two of three abnormal labs, so high LDH plus high indirect bilirubin can come from liver disease or tissue injury without hemolysis. The stricter label requires haptoglobin below 30 mg/dL plus high LDH or high indirect bilirubin. Both labels are compared on the same patients: those worked up with a haptoglobin result.
+
+```{r strict-label, eval = enough}
+strict_data <- phenotype |>
+  filter(worked_up, !is.na(hapto)) |>
+  mutate(male   = as.integer(gender == "M"),
+         strict = hapto < 30 & (coalesce(ldh > 250, FALSE) | coalesce(ibili > 1.0, FALSE))) |>
+  select(subject_id, hemolysis, strict, all_of(cbc_features), age, male) |>
+  drop_na()
+
+strict_counts <- tibble(
+  label    = c("Main (2 of 3)", "Strict (low haptoglobin + 1)"),
+  patients = nrow(strict_data),
+  cases    = c(sum(strict_data$hemolysis), sum(strict_data$strict))
+)
+strict_counts |> mutate(cases = suppress(cases))
+
+# Cross-validated AUROC for one label on these patients
+cv_auroc <- function(label_col) {
+  d <- strict_data |>
+    mutate(y = factor(.data[[label_col]], levels = c(FALSE, TRUE), labels = c("no", "yes")))
+  if (sum(d$y == "yes") < 10) return(tibble(model = c("lasso", "rf"), auroc = NA_real_,
+                                            lower = NA_real_, upper = NA_real_))
+  f <- vfold_cv(d, v = 5, strata = y)
+  p <- map_dfr(f$splits, function(s) {
+    train <- analysis(s); test <- assessment(s)
+    tibble(y = test$y,
+           lasso = pred_lasso(fit_lasso(train), test),
+           rf    = pred_rf(fit_rf(train), test))
+  })
+  map_dfr(c("lasso", "rf"), function(m) {
+    r  <- roc(p$y, p[[m]], levels = c("no", "yes"), direction = "<", quiet = TRUE)
+    ci <- ci.auc(r)
+    tibble(model = m, auroc = as.numeric(auc(r)), lower = ci[1], upper = ci[3])
+  })
+}
+
+strict_auc <- bind_rows(
+  cv_auroc("hemolysis") |> mutate(label = "Main (2 of 3)"),
+  cv_auroc("strict")    |> mutate(label = "Strict (low haptoglobin + 1)")
+) |> select(label, model, auroc, lower, upper)
+strict_auc
+```
+
+### Interpretation
+
+```{r interp-numbers}
+#| echo: false
+# Numbers quoted in the text below, pulled from the tables above
+pct <- function(x) paste0(round(100 * x, 1), "%")
+f3  <- function(x) sprintf("%.3f", x)
+if (enough) {
+  a05 <- filter(alert_table, alert_rate == 0.05)
+  a10 <- filter(alert_table, alert_rate == 0.10)
+  a20 <- filter(alert_table, alert_rate == 0.20)
+  sm  <- filter(strict_auc, label == "Main (2 of 3)", model == "lasso")
+  ss  <- filter(strict_auc, label == "Strict (low haptoglobin + 1)", model == "lasso")
+} else {
+  a05 <- a10 <- a20 <- tibble(sensitivity = NA, ppv = NA, lift = NA,
+                              untested_share = NA, untested_flagged = NA)
+  sm <- ss <- tibble(auroc = NA, lower = NA, upper = NA)
+  strict_counts <- tibble(patients = NA, cases = c(NA, NA))
+}
+strict_higher  <- isTRUE(ss$auroc > sm$auroc)
+strict_overlap <- isTRUE(ss$lower <= sm$upper & sm$lower <= ss$upper)
+```
+
+Of 140,091 anemic adults, only 7,997 (5.7%) had a hemolysis panel around the index CBC, and 1,604 of those met the hemolysis phenotype. Forty-seven also had an AIHA code. Among worked-up patients, the CBC, age, and sex predicted hemolysis with a cross-validated AUROC of 0.750 (95% CI 0.736 to 0.763) for the lasso and 0.755 (0.742 to 0.769) for the random forest, so the simpler lasso is preferred. Higher RDW, MCH, and MCHC raised the predicted risk, and higher platelet count and older age lowered it, which fits reticulocytosis and, in some subtypes, spherocytes or cold agglutination.
+
+At a threshold that catches 90% of hemolysis cases, the positive predictive value was 25.5%, about 3.9 panels per case found, compared with a 20% base rate among worked-up patients. Applied to untested patients, the same threshold flagged half of them, which is too many for a practical alert. A CDS rule would need a stricter threshold, accepting lower sensitivity.
+
+Setting the threshold by alert rate instead gives a workable alert burden at lower sensitivity. Alerting on the top 10% of scores caught `r pct(a10$sensitivity)` of hemolysis cases with a PPV of `r pct(a10$ppv)`, `r round(a10$lift, 1)` times the base rate. At the top 5%, sensitivity was `r pct(a05$sensitivity)` and PPV `r pct(a05$ppv)`; at the top 20%, sensitivity was `r pct(a20$sensitivity)` and PPV `r pct(a20$ppv)`. Applied to untested patients, the top-10% cutoff flagged `r pct(a10$untested_share)` of them (`r a10$untested_flagged` patients).
+
+On the `r format(strict_counts$patients[1], big.mark = ",")` worked-up patients with a haptoglobin result, the strict label counted `r suppress(strict_counts$cases[2])` cases against `r suppress(strict_counts$cases[1])` for the main label. The lasso AUROC was `r f3(ss$auroc)` (95% CI `r f3(ss$lower)` to `r f3(ss$upper)`) with the strict label and `r f3(sm$auroc)` (`r f3(sm$lower)` to `r f3(sm$upper)`) with the main label, so the strict label was `r if (strict_higher) "higher" else "lower"` and the intervals `r if (strict_overlap) "overlap" else "do not overlap"`. `r if (strict_higher && !strict_overlap) "Label noise from LDH and bilirubin rises without hemolysis appears to limit the main model." else if (strict_overlap) "Label noise does not explain the moderate discrimination; the limit is the signal in the CBC itself." else "Requiring low haptoglobin did not sharpen the signal the CBC carries."`
+
+Two limitations shape these results. The model learns only from patients clinicians chose to test, so its scores on untested patients carry that selection. And the hemolysis rule also catches non-immune hemolysis and liver disease, while the AIHA tier relies on codes because MIMIC-IV has no DAT.
+
+## Conclusion
+
+Hemolysis is rarely checked in anemic patients, and a model using only the CBC, age, and sex can rank who is likely to have it with moderate discrimination. At a high-sensitivity threshold the model flags too many patients to work as an alert, so a CDS rule built on it should set its threshold by alert burden (@sec-results). Because the label exists only for patients clinicians chose to test, the model's value for untested patients still needs to be checked against an outcome that does not depend on testing.

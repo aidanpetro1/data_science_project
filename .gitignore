@@ -1,0 +1,15 @@
+# R and RStudio
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Quarto render byproducts
+.quarto/
+final_project_files/
+
+# MIMIC-IV data must never be committed
+data/
+*.csv
+*.csv.gz
+*.rds
